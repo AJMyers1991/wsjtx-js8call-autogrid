@@ -21,6 +21,7 @@ import threading
 import configparser
 from datetime import datetime, timedelta
 from typing import Optional, Tuple, Dict, Any
+import psutil
 
 # Import serial for GPS communication
 try:
@@ -552,10 +553,14 @@ class ApplicationCommunicator:
         self.wsjtx_id = None
         self.wsjtx_last_grid = None
         self.js8call_last_grid = None
-        
-        # WSJT-X packet constants
+        self.wsjtx_last_addr = None  # Store last WSJT-X address/port
         self.MAGIC_NUMBER = 0xadbccbda
-        self.SCHEMA_VERSION = 2  # Updated to match your WSJT-X version
+        self.SCHEMA_VERSION = 3  # Updated to match your WSJT-X version
+        self.wsjtx_last_packet_time = None  # Track last packet time for WSJT-X
+        self.js8call_last_packet_time = None  # Track last packet time for JS8Call
+        self.detection_timeout = 30  # seconds
+        self.wsjtx_pending_grid_update = False  # Flag to trigger grid update after next packet
+        self.pending_grid_value: Optional[str] = None  # Store pending grid value
         
     def start(self):
         """Start communication with both applications."""
@@ -604,34 +609,61 @@ class ApplicationCommunicator:
             
         self.logger.info("Application communication stopped")
     
+    def is_wsjtx_process_running(self):
+        for proc in psutil.process_iter(['name']):
+            try:
+                if proc.info['name'] and 'wsjtx' in proc.info['name'].lower():
+                    return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        return False
+    
+    def is_js8call_process_running(self):
+        found = False
+        for proc in psutil.process_iter(['name']):
+            try:
+                name = proc.info['name']
+                if name and any(n in name.lower() for n in ['js8call', 'js8']):
+                    found = True
+                    break
+            except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+                continue
+        self.logger.debug(f"[ProcessCheck] JS8Call running: {found}")
+        return found
+    
     def check_heartbeats(self) -> tuple[bool, bool]:
         """Check for heartbeats from both applications."""
         wsjtx_detected = False
         js8call_detected = False
-        
+        now = time.time()
         # Check WSJT-X socket
         try:
             if self.socket:
                 data, addr = self.socket.recvfrom(1024)
-                
-                # Log all WSJT-X packets for debugging
                 if len(data) >= 16:
                     try:
                         magic, schema, pkt_type, id_len = struct.unpack('>LLLL', data[:16])
-                        
                         if magic == self.MAGIC_NUMBER:
-                            # Log packet details
                             packet_info = f"WSJT-X Packet: type={pkt_type}, schema={schema}, from={addr}"
                             if id_len > 0 and len(data) >= 16 + id_len:
                                 wsjtx_id = data[16:16+id_len].decode('utf-8')
                                 packet_info += f", id={wsjtx_id}"
-                            
-                            # Log different packet types
                             if pkt_type == 0:  # Heartbeat
                                 self.logger.debug(f"{packet_info} (Heartbeat)")
                                 wsjtx_detected = True
+                                self.wsjtx_last_addr = addr
+                                self.wsjtx_last_packet_time = now
+                                # If a grid update is pending, send it now
+                                if self.wsjtx_pending_grid_update:
+                                    self._send_pending_wsjtx_grid_update()
                             elif pkt_type == 1:  # Status
                                 self.logger.debug(f"{packet_info} (Status)")
+                                wsjtx_detected = True
+                                self.wsjtx_last_addr = addr
+                                self.wsjtx_last_packet_time = now
+                                # If a grid update is pending, send it now
+                                if self.wsjtx_pending_grid_update:
+                                    self._send_pending_wsjtx_grid_update()
                             elif pkt_type == 2:  # Decode
                                 self.logger.debug(f"{packet_info} (Decode)")
                             elif pkt_type == 3:  # Clear
@@ -663,59 +695,40 @@ class ApplicationCommunicator:
                             else:
                                 self.logger.debug(f"{packet_info} (Unknown type)")
                             
-                            # Store WSJT-X ID for later use
                             if pkt_type == 0 and id_len > 0 and len(data) >= 16 + id_len:
                                 self.wsjtx_id = data[16:16+id_len].decode('utf-8')
-                                
                     except struct.error as e:
                         self.logger.debug(f"WSJT-X packet parsing error: {e}")
                     except UnicodeDecodeError as e:
                         self.logger.debug(f"WSJT-X packet decode error: {e}")
                 else:
                     self.logger.debug(f"WSJT-X short packet received: {len(data)} bytes from {addr}")
-                    
         except socket.timeout:
             pass
         except Exception as e:
             self.logger.debug(f"WSJT-X heartbeat check error: {e}")
-        
-        # Check JS8-Call socket
-        try:
-            if hasattr(self, 'js8call_socket') and self.js8call_socket:
-                data, addr = self.js8call_socket.recvfrom(1024)
-                
-                # Try to parse as JS8-Call JSON
-                try:
-                    message = json.loads(data.decode('utf-8'))
-                    if message.get('type') == 'PING':
-                        self.logger.debug("JS8-Call ping received")
-                        js8call_detected = True
-                    else:
-                        self.logger.debug(f"JS8-Call message: {message}")
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    self.logger.debug(f"JS8-Call non-JSON data: {data.decode('utf-8', errors='ignore')}")
-        except socket.timeout:
-            pass
-        except Exception as e:
-            self.logger.debug(f"JS8-Call heartbeat check error: {e}")
-        
+        # Timeout logic for detection
+        if self.wsjtx_last_packet_time is not None and (now - self.wsjtx_last_packet_time) > self.detection_timeout:
+            wsjtx_detected = False
+        if not self.is_wsjtx_process_running():
+            wsjtx_detected = False
+        # JS8Call detection is now process-only
+        js8call_detected = self.is_js8call_process_running()
         return wsjtx_detected, js8call_detected
     
     def send_wsjtx_grid_update(self, grid: str) -> bool:
-        """Send grid square update to WSJT-X using a raw UDP socket (not bound to 2237)."""
-        if not self.wsjtx_id:
+        """Send grid square update to WSJT-X using a new UDP socket (let OS choose source port)."""
+        if not self.wsjtx_id or not self.wsjtx_last_addr:
             return False
         try:
             # Build location change packet with "GRID:" prefix (like the working sample)
             packet = self._build_wsjtx_location_packet("GRID:" + grid)
-
-            # Use a raw UDP socket for sending (do NOT bind to 2237)
+            # Create a new UDP socket for sending, do not bind to any port
             udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            udp_sock.sendto(packet, ("127.0.0.1", self.wsjtx_port))
+            udp_sock.sendto(packet, self.wsjtx_last_addr)
             udp_sock.close()
-
             self.wsjtx_last_grid = grid
-            self.logger.info(f"Sent grid update to WSJT-X: {grid}")
+            self.logger.info(f"Sent grid update to WSJT-X: {grid} (to {self.wsjtx_last_addr})")
             return True
         except Exception as e:
             self.logger.error(f"Failed to send grid update to WSJT-X: {e}")
@@ -786,6 +799,19 @@ class ApplicationCommunicator:
         packet.extend(grid_bytes)
         
         return bytes(packet)
+    
+    def _send_pending_wsjtx_grid_update(self):
+        # Send the pending grid update to WSJT-X after a short delay, multiple times for reliability
+        if hasattr(self, 'pending_grid_value') and self.pending_grid_value:
+            self.logger.info(f"Preparing to send pending grid update to WSJT-X: {self.pending_grid_value}")
+            self.logger.info(f"WSJT-X update will be sent to {self.wsjtx_last_addr} with ID {self.wsjtx_id}")
+            time.sleep(2)  # Wait 2 seconds before sending
+            for i in range(3):
+                self.logger.info(f"Sending pending grid update to WSJT-X (attempt {i+1}/3): {self.pending_grid_value}")
+                self.send_wsjtx_grid_update(self.pending_grid_value)
+                time.sleep(1)
+            self.wsjtx_pending_grid_update = False
+            self.pending_grid_value = None
 
 
 class AutoGrid:
@@ -802,7 +828,9 @@ class AutoGrid:
         self.running = False
         self.wsjtx_detected = False
         self.js8call_detected = False
-        
+        # Track previous detection state for restart detection
+        self.prev_wsjtx_detected = False
+        self.prev_js8call_detected = False
         # Timing settings
         self.heartbeat_interval = self.config.getint('ADVANCED', 'heartbeat_interval', fallback=10)
         self.sleep_interval = self.config.getint('ADVANCED', 'sleep_interval', fallback=5)
@@ -836,45 +864,44 @@ class AutoGrid:
         """Main application loop."""
         while self.running:
             try:
-                # Check for application heartbeats
-                self._check_applications()
-                
-                # Update grid squares if needed
+                wsjtx_running, js8call_running = self.app_comm.check_heartbeats()
+                # Detect transitions for WSJT-X
+                if wsjtx_running and not self.wsjtx_detected:
+                    self.logger.info("WSJT-X detected")
+                if not wsjtx_running and self.wsjtx_detected:
+                    self.logger.info("WSJT-X no longer detected")
+                # Detect transitions for JS8Call
+                if js8call_running and not self.js8call_detected:
+                    self.logger.info("JS8-Call detected")
+                if not js8call_running and self.js8call_detected:
+                    self.logger.info("JS8-Call no longer detected")
+                # Immediately send grid update if either app was just (re)detected
+                current_grid = self.gps_manager.get_current_grid()
+                if current_grid:
+                    if wsjtx_running and not self.prev_wsjtx_detected:
+                        # Instead of sending immediately, set a pending flag
+                        self.app_comm.wsjtx_pending_grid_update = True
+                        self.app_comm.pending_grid_value = current_grid
+                    if js8call_running and not self.prev_js8call_detected:
+                        self._send_js8call_grid_update_with_retry(current_grid)
+                # Update detection state
+                self.prev_wsjtx_detected = wsjtx_running
+                self.prev_js8call_detected = js8call_running
+                self.wsjtx_detected = wsjtx_running
+                self.js8call_detected = js8call_running
+                # Update grid squares if needed (normal logic)
                 self._update_grid_squares()
-                
                 # Sleep based on application status
                 if self.wsjtx_detected or self.js8call_detected:
                     time.sleep(self.heartbeat_interval)
                 else:
                     time.sleep(self.sleep_interval)
-                    
             except KeyboardInterrupt:
                 self.logger.info("Received interrupt signal")
                 break
             except Exception as e:
                 self.logger.error(f"Main loop error: {e}")
                 time.sleep(self.retry_interval)
-    
-    def _check_applications(self):
-        """Check for running applications."""
-        wsjtx_running, js8call_running = self.app_comm.check_heartbeats()
-        
-        # Update detection status
-        if wsjtx_running and not self.wsjtx_detected:
-            self.logger.info("WSJT-X detected")
-            self.wsjtx_detected = True
-        
-        if js8call_running and not self.js8call_detected:
-            self.logger.info("JS8-Call detected")
-            self.js8call_detected = True
-        
-        if not wsjtx_running and self.wsjtx_detected:
-            self.logger.info("WSJT-X no longer detected")
-            self.wsjtx_detected = False
-        
-        if not js8call_running and self.js8call_detected:
-            self.logger.info("JS8-Call no longer detected")
-            self.js8call_detected = False
     
     def _update_grid_squares(self):
         """Update grid squares in detected applications."""

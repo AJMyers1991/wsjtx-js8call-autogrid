@@ -11,4 +11,6 @@ configparser>=5.0.0
 gpsd-py3>=0.3.0
 
 # Optional: For creating Windows executables
-# pyinstaller>=4.0 
+# pyinstaller>=4.0
+
+psutil 
