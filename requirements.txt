@@ -1,0 +1,14 @@
+# Core dependencies for WSJT-X/JS8-Call Auto Grid
+# Minimal set of packages for cross-platform compatibility
+
+# Serial communication for GPS devices
+pyserial>=3.5
+
+# Configuration file parsing
+configparser>=5.0.0
+
+# GPSD client for Linux systems
+gpsd-py3>=0.3.0
+
+# Optional: For creating Windows executables
+# pyinstaller>=4.0 
