@@ -12,6 +12,7 @@ Automatically updates your grid square location in WSJT-X and JS8-Call based on 
 - **GridTracker Compatible**: Releases control after updates to allow GridTracker to run
 - **Extensive Logging**: Detailed logs for troubleshooting and monitoring
 - **Easy Configuration**: Simple INI file configuration with detailed comments
+- **Optional System Clock Sync**: Can set your computer's clock to GPS time (Windows & Linux, admin/root required)
 
 ## Quick Start
 
@@ -90,6 +91,19 @@ gpsd_host = localhost
 # Default GPSD port
 gpsd_port = 2947
 ```
+
+#### System Clock Sync
+If you want the program to set your computer's clock to GPS time, enable this in the `[GPS]` section:
+
+```ini
+# Set your computer's clock to GPS time (requires admin/root)
+sync_system_clock = true
+```
+
+- On **Windows**, the script must be run as Administrator.
+- On **Linux**, the script must be run with `sudo` or as root.
+- The clock will only be set if the GPS fix is valid and the time is recent.
+- The script will not set the clock more than once per minute, and only if the drift is greater than 2 seconds.
 
 ### Application Settings
 
@@ -200,6 +214,11 @@ Log files are stored in the `logs` folder with timestamps:
 - `autogrid_YYYYMMDD_HHMMSS.log`
 - Old log files are automatically deleted (keeps 5 by default)
 - Check log files for detailed error information
+
+### System Clock Sync Issues
+- **Permission denied**: Make sure you run the script as Administrator (Windows) or with `sudo` (Linux).
+- **Clock not changing**: Check the logs for errors. Some systems may require additional permissions or configuration to allow time changes.
+- **Verifying**: After running, check your system clock and the log file for confirmation of successful sync.
 
 ## Advanced Configuration
 
