@@ -7,8 +7,7 @@ pyserial>=3.5
 # Configuration file parsing
 configparser>=5.0.0
 
-# GPSD client for Linux systems
-gpsd-py3>=0.3.0
+# GPSD support is now built-in - no external module required
 
 # Optional: For creating Windows executables
 # pyinstaller>=4.0

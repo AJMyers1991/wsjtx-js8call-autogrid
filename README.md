@@ -175,6 +175,7 @@ For Linux systems with GPSD:
 2. **Start GPSD**: `sudo systemctl start gpsd`
 3. **Enable GPSD**: `sudo systemctl enable gpsd`
 4. **Configure the program** to use GPSD source
+5. **No additional Python modules required** - GPSD support is built-in
 
 ## Troubleshooting
 
@@ -267,7 +268,7 @@ wsjtx-js8call-autogrid/
 
 - **pyserial**: Serial communication for GPS devices
 - **configparser**: Configuration file parsing (built-in)
-- **gpsd-py3**: GPSD client for Linux systems
+- **GPSD support**: Built-in direct socket communication (no external module required)
 
 ## Installation Methods
 

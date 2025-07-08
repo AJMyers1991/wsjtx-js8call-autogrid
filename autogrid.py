@@ -33,11 +33,7 @@ except ImportError:
     print("Error: pyserial not installed. Run: pip install pyserial")
     sys.exit(1)
 
-# Import GPSD for Linux systems
-try:
-    import gpsd  # type: ignore
-except ImportError:
-    gpsd = None
+# GPSD support is now built-in - no external module required
 
 # Import configparser for configuration
 try:
@@ -680,26 +676,76 @@ class GPSManager:
             self.logger.error(f"Serial GPS error: {e}")
     
     def _handle_gpsd_gps(self):
-        """Handle GPSD GPS data."""
-        if gpsd is None:
-            self.logger.error("GPSD not available - install gpsd-py3")
-            return
-        
+        """Handle GPSD GPS data using direct socket communication."""
         try:
             host = self.config.get('GPS_GPSD', 'gpsd_host', fallback='localhost')
             port = self.config.getint('GPS_GPSD', 'gpsd_port', fallback=2947)
             timeout = self.config.getint('GPS_GPSD', 'gpsd_timeout', fallback=10)
             
-            gpsd.connect(host, port)
-            packet = gpsd.get_current()
+            self.logger.debug(f"Connecting to GPSD at {host}:{port}, timeout {timeout}s")
             
-            if packet.mode >= 2:  # 2D or 3D fix
-                lat = packet.lat
-                lon = packet.lon
-                self._update_position(lat, lon)
-                
+            # Create socket connection to GPSD
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((host, port))
+            
+            # Send version command to get JSON output
+            sock.send(b'?VERSION;\n')
+            version_response = sock.recv(1024).decode('utf-8', errors='ignore')
+            self.logger.debug(f"GPSD version: {version_response.strip()}")
+            
+            # Send watch command to enable JSON output
+            sock.send(b'?WATCH={"enable":true,"json":true};\n')
+            watch_response = sock.recv(1024).decode('utf-8', errors='ignore')
+            self.logger.debug(f"GPSD watch response: {watch_response.strip()}")
+            
+            # Read GPS data
+            data = sock.recv(1024).decode('utf-8', errors='ignore')
+            self.logger.debug(f"GPSD raw data: {repr(data)}")
+            
+            # Parse JSON response
+            lines = data.split('\n')
+            for line in lines:
+                line = line.strip()
+                if line.startswith('{') and line.endswith('}'):
+                    try:
+                        gps_data = json.loads(line)
+                        self.logger.debug(f"GPSD JSON: {gps_data}")
+                        
+                        # Check if this is a TPV (Time Position Velocity) report
+                        if gps_data.get('class') == 'TPV':
+                            lat = gps_data.get('lat')
+                            lon = gps_data.get('lon')
+                            mode = gps_data.get('mode', 0)
+                            
+                            if lat is not None and lon is not None and mode >= 2:  # 2D or 3D fix
+                                self.logger.info(f"[GPSD] Parsed valid position: lat={lat}, lon={lon}, mode={mode}")
+                                self._update_position(lat, lon)
+                                break
+                            else:
+                                self.logger.debug(f"[GPSD] No valid position in TPV: lat={lat}, lon={lon}, mode={mode}")
+                        
+                        # Check if this is a SKY (Satellite) report for time sync
+                        elif gps_data.get('class') == 'SKY':
+                            time_str = gps_data.get('time')
+                            if time_str:
+                                try:
+                                    # Parse GPSD time format (ISO 8601)
+                                    gps_time = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+                                    self.nmea_parser.last_utc_time = gps_time
+                                    self.logger.debug(f"[GPSD] Parsed time: {gps_time}")
+                                except Exception as e:
+                                    self.logger.debug(f"[GPSD] Error parsing time {time_str}: {e}")
+                    
+                    except json.JSONDecodeError as e:
+                        self.logger.debug(f"[GPSD] JSON decode error: {e}")
+                        continue
+            
+            sock.close()
+            self.logger.debug(f"GPSD connection to {host}:{port} closed")
+            
         except Exception as e:
-            self.logger.debug(f"GPSD error: {e}")
+            self.logger.error(f"GPSD error: {e}")
     
     def _process_nmea_sentence(self, sentence: str):
         """Process NMEA sentence and update position."""
