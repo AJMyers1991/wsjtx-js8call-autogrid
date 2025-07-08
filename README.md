@@ -267,8 +267,7 @@ wsjtx-js8call-autogrid/
 ## Dependencies
 
 - **pyserial**: Serial communication for GPS devices
-- **configparser**: Configuration file parsing (built-in)
-- **GPSD support**: Built-in direct socket communication (no external module required)
+- **psutil**: Process detection for Linux and Windows
 
 ## Installation Methods
 
@@ -287,12 +286,7 @@ pip install -e .
 autogrid
 ```
 
-### Method 3: Windows Executable (Future)
-```bash
-# Create standalone executable
-pip install pyinstaller
-pyinstaller --onefile autogrid.py
-```
+
 
 ## Support
 
