@@ -699,47 +699,85 @@ class GPSManager:
             watch_response = sock.recv(1024).decode('utf-8', errors='ignore')
             self.logger.debug(f"GPSD watch response: {watch_response.strip()}")
             
-            # Read GPS data
-            data = sock.recv(1024).decode('utf-8', errors='ignore')
-            self.logger.debug(f"GPSD raw data: {repr(data)}")
+            # Set shorter timeout for data reading
+            sock.settimeout(2.0)
             
-            # Parse JSON response
-            lines = data.split('\n')
-            for line in lines:
-                line = line.strip()
-                if line.startswith('{') and line.endswith('}'):
-                    try:
-                        gps_data = json.loads(line)
-                        self.logger.debug(f"GPSD JSON: {gps_data}")
-                        
-                        # Check if this is a TPV (Time Position Velocity) report
-                        if gps_data.get('class') == 'TPV':
-                            lat = gps_data.get('lat')
-                            lon = gps_data.get('lon')
-                            mode = gps_data.get('mode', 0)
-                            
-                            if lat is not None and lon is not None and mode >= 2:  # 2D or 3D fix
-                                self.logger.info(f"[GPSD] Parsed valid position: lat={lat}, lon={lon}, mode={mode}")
-                                self._update_position(lat, lon)
-                                break
-                            else:
-                                self.logger.debug(f"[GPSD] No valid position in TPV: lat={lat}, lon={lon}, mode={mode}")
-                        
-                        # Check if this is a SKY (Satellite) report for time sync
-                        elif gps_data.get('class') == 'SKY':
-                            time_str = gps_data.get('time')
-                            if time_str:
-                                try:
-                                    # Parse GPSD time format (ISO 8601)
-                                    gps_time = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
-                                    self.nmea_parser.last_utc_time = gps_time
-                                    self.logger.debug(f"[GPSD] Parsed time: {gps_time}")
-                                except Exception as e:
-                                    self.logger.debug(f"[GPSD] Error parsing time {time_str}: {e}")
-                    
-                    except json.JSONDecodeError as e:
-                        self.logger.debug(f"[GPSD] JSON decode error: {e}")
+            # Buffer for incomplete JSON lines
+            buffer = ""
+            found_valid = False
+            
+            # Try to read GPS data multiple times (similar to serial GPS)
+            for attempt in range(10):
+                if not self.running:
+                    self.logger.debug("GPSD handler stopped by user.")
+                    break
+                
+                try:
+                    # Read data from GPSD
+                    data = sock.recv(1024).decode('utf-8', errors='ignore')
+                    if not data:
+                        self.logger.debug(f"[GPSD] No data received on attempt {attempt + 1}")
                         continue
+                    
+                    self.logger.debug(f"[GPSD] Raw data attempt {attempt + 1}: {repr(data)}")
+                    
+                    # Add to buffer and process complete lines
+                    buffer += data
+                    lines = buffer.split('\n')
+                    
+                    # Keep the last line in buffer (might be incomplete)
+                    buffer = lines[-1]
+                    
+                    # Process complete lines
+                    for line in lines[:-1]:
+                        line = line.strip()
+                        if line.startswith('{') and line.endswith('}'):
+                            try:
+                                gps_data = json.loads(line)
+                                self.logger.debug(f"[GPSD] JSON: {gps_data}")
+                                
+                                # Check if this is a TPV (Time Position Velocity) report
+                                if gps_data.get('class') == 'TPV':
+                                    lat = gps_data.get('lat')
+                                    lon = gps_data.get('lon')
+                                    mode = gps_data.get('mode', 0)
+                                    
+                                    if lat is not None and lon is not None and mode >= 2:  # 2D or 3D fix
+                                        self.logger.info(f"[GPSD] Parsed valid position: lat={lat}, lon={lon}, mode={mode}")
+                                        self._update_position(lat, lon)
+                                        found_valid = True
+                                        break
+                                    else:
+                                        self.logger.debug(f"[GPSD] No valid position in TPV: lat={lat}, lon={lon}, mode={mode}")
+                                
+                                # Check if this is a SKY (Satellite) report for time sync
+                                elif gps_data.get('class') == 'SKY':
+                                    time_str = gps_data.get('time')
+                                    if time_str:
+                                        try:
+                                            # Parse GPSD time format (ISO 8601)
+                                            gps_time = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+                                            self.nmea_parser.last_utc_time = gps_time
+                                            self.logger.debug(f"[GPSD] Parsed time: {gps_time}")
+                                        except Exception as e:
+                                            self.logger.debug(f"[GPSD] Error parsing time {time_str}: {e}")
+                            
+                            except json.JSONDecodeError as e:
+                                self.logger.debug(f"[GPSD] JSON decode error: {e}")
+                                continue
+                    
+                    if found_valid:
+                        break
+                        
+                except socket.timeout:
+                    self.logger.debug(f"[GPSD] Timeout on attempt {attempt + 1}")
+                    continue
+                except Exception as e:
+                    self.logger.debug(f"[GPSD] Error on attempt {attempt + 1}: {e}")
+                    break
+            
+            if not found_valid:
+                self.logger.warning("[GPSD] No valid GPS position found in 10 attempts.")
             
             sock.close()
             self.logger.debug(f"GPSD connection to {host}:{port} closed")
