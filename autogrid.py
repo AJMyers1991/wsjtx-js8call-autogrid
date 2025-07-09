@@ -19,9 +19,12 @@ import struct
 import logging
 import threading
 import configparser
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from typing import Optional, Tuple, Dict, Any
 import psutil
+import platform
+import subprocess
+import ctypes
 
 # Import serial for GPS communication
 try:
@@ -30,11 +33,7 @@ except ImportError:
     print("Error: pyserial not installed. Run: pip install pyserial")
     sys.exit(1)
 
-# Import GPSD for Linux systems
-try:
-    import gpsd  # type: ignore
-except ImportError:
-    gpsd = None
+# GPSD support is now built-in - no external module required
 
 # Import configparser for configuration
 try:
@@ -109,7 +108,8 @@ class LogManager:
         self.cleanup_old_logs()
         
         # Setup logging format
-        log_level = getattr(logging, self.config.get('LOGGING', 'log_level', fallback='INFO').upper())
+        log_level_str = self.config.get('LOGGING', 'log_level', fallback='INFO').upper()
+        log_level = logging.DEBUG if log_level_str == 'DEBUG' else logging.INFO
         debug_mode = self.config.getboolean('LOGGING', 'debug_mode', fallback=False)
         
         # Create log filename with timestamp
@@ -209,47 +209,46 @@ class NMEAParser:
     
     def __init__(self):
         self.logger = logging.getLogger(__name__)
+        self.last_utc_time = None
     
     def parse_nmea_sentence(self, sentence: str) -> Optional[Tuple[float, float]]:
         """
         Parse NMEA sentence and extract latitude/longitude.
-        
-        Args:
-            sentence: NMEA sentence string
-        
-        Returns:
-            Tuple of (latitude, longitude) in decimal degrees, or None if invalid
         """
         try:
-            # Clean the sentence
             sentence = sentence.strip()
             if not sentence.startswith('$'):
                 return None
-            
-            # Split into components
             parts = sentence.split(',')
             if len(parts) < 6:
                 return None
-            
             sentence_type = parts[0]
-            
-            # Parse different NMEA sentence types
             if sentence_type == '$GPGLL':
                 return self._parse_gpgll(parts)
             elif sentence_type == '$GPGGA':
                 return self._parse_gpgga(parts)
             elif sentence_type == '$GPRMC':
                 return self._parse_gprmc(parts)
+            elif sentence_type == '$GPGNS' or sentence_type == '$GNGNS':
+                return self._parse_gns(parts)
+            elif sentence_type == '$GPBWC':
+                return self._parse_bwc(parts)
+            elif sentence_type == '$GPRMB':
+                return self._parse_rmb(parts)
+            elif sentence_type == '$GPWPL':
+                return self._parse_wpl(parts)
+            elif sentence_type == '$GPAPB':
+                return self._parse_apb(parts)
             elif sentence_type == '$GPVTG':
                 return self._parse_gpvtg(parts)
+            elif sentence_type == '$GPZDA':
+                return self._parse_zda(parts)
             else:
-                # Try generic parsing for other sentence types
                 return self._parse_generic(parts)
-                
         except Exception as e:
             self.logger.debug(f"Error parsing NMEA sentence: {e}")
             return None
-    
+
     def _parse_gpgll(self, parts: list) -> Optional[Tuple[float, float]]:
         """Parse GPGLL sentence."""
         try:
@@ -260,11 +259,13 @@ class NMEAParser:
             lat_dir = parts[2]
             lon_raw = parts[3]
             lon_dir = parts[4]
+            time_str = parts[5]
             status = parts[6]
             
             if status != 'A':  # Not active
                 return None
             
+            self.last_utc_time = self._parse_nmea_time(time_str, "")
             lat = self._convert_nmea_coord(lat_raw, lat_dir)
             lon = self._convert_nmea_coord(lon_raw, lon_dir)
             
@@ -278,6 +279,7 @@ class NMEAParser:
             if len(parts) < 15:
                 return None
             
+            time_str = parts[1]
             lat_raw = parts[2]
             lat_dir = parts[3]
             lon_raw = parts[4]
@@ -287,6 +289,7 @@ class NMEAParser:
             if fix_quality == '0':  # No fix
                 return None
             
+            self.last_utc_time = self._parse_nmea_time(time_str, "")
             lat = self._convert_nmea_coord(lat_raw, lat_dir)
             lon = self._convert_nmea_coord(lon_raw, lon_dir)
             
@@ -300,15 +303,18 @@ class NMEAParser:
             if len(parts) < 12:
                 return None
             
+            time_str = parts[1]
+            status = parts[2]
             lat_raw = parts[3]
             lat_dir = parts[4]
             lon_raw = parts[5]
             lon_dir = parts[6]
-            status = parts[2]
+            date_str = parts[9] if len(parts) > 9 and parts[9] else ""
             
             if status != 'A':  # Not active
                 return None
             
+            self.last_utc_time = self._parse_nmea_time(time_str, date_str)
             lat = self._convert_nmea_coord(lat_raw, lat_dir)
             lon = self._convert_nmea_coord(lon_raw, lon_dir)
             
@@ -387,6 +393,143 @@ class NMEAParser:
         
         return decimal_degrees
 
+    def _parse_gns(self, parts: list) -> Optional[Tuple[float, float]]:
+        """Parse GNS sentence (GNSS Fix Data)."""
+        try:
+            if len(parts) < 6:
+                return None
+            time_str = parts[1]
+            lat_raw = parts[2]
+            lat_dir = parts[3]
+            lon_raw = parts[4]
+            lon_dir = parts[5]
+            if not lat_raw or not lon_raw:
+                return None
+            self.last_utc_time = self._parse_nmea_time(time_str, "")
+            lat = self._convert_nmea_coord(lat_raw, lat_dir)
+            lon = self._convert_nmea_coord(lon_raw, lon_dir)
+            self.logger.debug(f"[GNS] Parsed lat={lat}, lon={lon}")
+            return (lat, lon)
+        except Exception as e:
+            self.logger.debug(f"Error parsing GNS: {e}")
+            return None
+
+    def _parse_bwc(self, parts: list) -> Optional[Tuple[float, float]]:
+        """Parse BWC sentence (Bearing and Distance to Waypoint)."""
+        try:
+            if len(parts) < 7:
+                return None
+            lat_raw = parts[3]
+            lat_dir = parts[4]
+            lon_raw = parts[5]
+            lon_dir = parts[6]
+            if not lat_raw or not lon_raw:
+                return None
+            lat = self._convert_nmea_coord(lat_raw, lat_dir)
+            lon = self._convert_nmea_coord(lon_raw, lon_dir)
+            self.logger.debug(f"[BWC] Parsed lat={lat}, lon={lon}")
+            return (lat, lon)
+        except Exception as e:
+            self.logger.debug(f"Error parsing BWC: {e}")
+            return None
+
+    def _parse_rmb(self, parts: list) -> Optional[Tuple[float, float]]:
+        """Parse RMB sentence (Recommended Minimum Navigation Info)."""
+        try:
+            if len(parts) < 10:
+                return None
+            lat_raw = parts[6]
+            lat_dir = parts[7]
+            lon_raw = parts[8]
+            lon_dir = parts[9]
+            if not lat_raw or not lon_raw:
+                return None
+            lat = self._convert_nmea_coord(lat_raw, lat_dir)
+            lon = self._convert_nmea_coord(lon_raw, lon_dir)
+            self.logger.debug(f"[RMB] Parsed lat={lat}, lon={lon}")
+            return (lat, lon)
+        except Exception as e:
+            self.logger.debug(f"Error parsing RMB: {e}")
+            return None
+
+    def _parse_wpl(self, parts: list) -> Optional[Tuple[float, float]]:
+        """Parse WPL sentence (Waypoint Location)."""
+        try:
+            if len(parts) < 5:
+                return None
+            lat_raw = parts[1]
+            lat_dir = parts[2]
+            lon_raw = parts[3]
+            lon_dir = parts[4]
+            if not lat_raw or not lon_raw:
+                return None
+            lat = self._convert_nmea_coord(lat_raw, lat_dir)
+            lon = self._convert_nmea_coord(lon_raw, lon_dir)
+            self.logger.debug(f"[WPL] Parsed lat={lat}, lon={lon}")
+            return (lat, lon)
+        except Exception as e:
+            self.logger.debug(f"Error parsing WPL: {e}")
+            return None
+
+    def _parse_apb(self, parts: list) -> Optional[Tuple[float, float]]:
+        """Parse APB sentence (Autopilot Sentence B)."""
+        try:
+            # APB can contain bearing/waypoint info, but lat/lon is not always present. Try to extract if available.
+            # There is no strict standard for lat/lon in APB, but some devices may include it in specific fields.
+            # We'll attempt to find lat/lon using the generic parser logic as a fallback.
+            return self._parse_generic(parts)
+        except Exception as e:
+            self.logger.debug(f"Error parsing APB: {e}")
+            return None
+
+    def _parse_zda(self, parts: list) -> Optional[Tuple[float, float]]:
+        """Parse ZDA sentence (UTC Date/Time)."""
+        try:
+            if len(parts) < 5:
+                return None
+            time_str = parts[1]
+            day = parts[2]
+            month = parts[3]
+            year = parts[4]
+            if not (time_str and day and month and year):
+                return None
+            date_str = f"{year}{month.zfill(2)}{day.zfill(2)}"  # yyyymmdd
+            self.last_utc_time = self._parse_nmea_time(time_str, date_str)
+            return None  # ZDA does not contain position
+        except Exception as e:
+            self.logger.debug(f"Error parsing ZDA: {e}")
+            return None
+
+    def _parse_nmea_time(self, time_str: str, date_str: str = "") -> Optional[datetime]:
+        """Parse NMEA UTC time (hhmmss[.sss]) and optional date (ddmmyy or yyyymmdd) to datetime (UTC)."""
+        try:
+            if not time_str or len(time_str) < 6:
+                return None
+            hour = int(time_str[0:2])
+            minute = int(time_str[2:4])
+            second = int(time_str[4:6])
+            microsecond = int(float('0.' + time_str.split('.')[1]) * 1e6) if '.' in time_str else 0
+            if date_str:
+                # Try ddmmyy or yyyymmdd
+                if len(date_str) == 6:  # ddmmyy
+                    day = int(date_str[0:2])
+                    month = int(date_str[2:4])
+                    year = 2000 + int(date_str[4:6])
+                elif len(date_str) == 8:  # yyyymmdd
+                    year = int(date_str[0:4])
+                    month = int(date_str[4:6])
+                    day = int(date_str[6:8])
+                else:
+                    return None
+                return datetime(year, month, day, hour, minute, second, microsecond, tzinfo=UTC)
+            else:
+                # Use today's date (UTC)
+                now = datetime.now(UTC)
+                return datetime(now.year, now.month, now.day, hour, minute, second, microsecond, tzinfo=UTC)
+        except Exception as e:
+            self.logger.debug(f"Error parsing NMEA time: {e}")
+            return None
+
 
 class GPSManager:
     """Manages GPS data from various sources."""
@@ -407,6 +550,26 @@ class GPSManager:
         
         self.running = False
         self.gps_thread = None
+        self.sync_system_clock = config.getboolean('GPS', 'sync_system_clock', fallback=False)
+        self.last_sync_time = None
+        self.sync_threshold_seconds = 2  # Only sync if drift > 2 seconds
+        self.sync_min_interval = 60  # Only sync once per minute
+        # Privilege check for system clock sync
+        if self.sync_system_clock:
+            is_admin = False
+            try:
+                if platform.system() == 'Windows':
+                    is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+                else:
+                    is_admin = (os.geteuid() == 0)
+            except Exception as e:
+                self.logger.warning(f"Could not determine privilege level: {e}")
+            if not is_admin:
+                warning_msg = ("WARNING: System clock sync is enabled, but the script is not running with "
+                               "administrator/root privileges. Clock sync will fail.\n"
+                               "Run this script as Administrator (Windows) or with sudo (Linux) to enable clock sync.")
+                print(warning_msg)
+                self.logger.info(warning_msg)
     
     def start(self):
         """Start GPS monitoring."""
@@ -443,74 +606,184 @@ class GPSManager:
                 time.sleep(10)  # Wait before retry
     
     def _handle_network_gps(self):
-        """Handle network GPS data."""
+        """Handle network GPS data with detailed logging and debugging."""
         try:
             ip = self.config.get('GPS_NETWORK', 'gps_ip')
             port = self.config.getint('GPS_NETWORK', 'gps_port')
             protocol = self.config.get('GPS_NETWORK', 'gps_protocol', fallback='tcp')
             timeout = self.config.getint('GPS_NETWORK', 'gps_timeout', fallback=10)
-            
+            self.logger.debug(f"Opening network GPS connection to {ip}:{port} via {protocol.upper()}, timeout {timeout}s")
             if protocol.lower() == 'tcp':
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             else:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            
             sock.settimeout(timeout)
             sock.connect((ip, port))
-            
+            self.logger.info(f"Network GPS connection to {ip}:{port} established.")
             # Read NMEA data
             data = sock.recv(1024).decode('utf-8', errors='ignore')
+            self.logger.debug(f"[Network] Raw data received: {repr(data)}")
             sock.close()
-            
+            self.logger.debug(f"Network GPS connection to {ip}:{port} closed.")
             # Parse NMEA sentences
-            for line in data.split('\n'):
+            found_valid = False
+            for i, line in enumerate(data.split('\n')):
                 if line.strip():
-                    self._process_nmea_sentence(line)
-                    
+                    self.logger.debug(f"[Network] Line {i+1}: {line.strip()}")
+                    coords = self.nmea_parser.parse_nmea_sentence(line)
+                    if coords:
+                        lat, lon = coords
+                        self.logger.info(f"[Network] Parsed valid position: lat={lat}, lon={lon}")
+                        self._update_position(lat, lon)
+                        found_valid = True
+                        break
+                    else:
+                        self.logger.debug(f"[Network] No valid position in line {i+1}.")
+            if not found_valid:
+                self.logger.warning("[Network] No valid GPS position found in received data.")
         except Exception as e:
-            self.logger.debug(f"Network GPS error: {e}")
+            self.logger.error(f"Network GPS error: {e}")
     
     def _handle_serial_gps(self):
-        """Handle serial GPS data."""
+        """Handle serial GPS data with detailed logging and debugging."""
         try:
             port = self.config.get('GPS_SERIAL', 'serial_port')
             baud = self.config.getint('GPS_SERIAL', 'serial_baud')
             timeout = self.config.getint('GPS_SERIAL', 'serial_timeout', fallback=5)
-            
+            self.logger.debug(f"Opening serial port {port} at {baud} baud, timeout {timeout}s")
             with serial.Serial(port, baud, timeout=timeout) as ser:
-                # Read a few lines to get current position
-                for _ in range(10):
+                self.logger.info(f"Serial port {port} opened successfully.")
+                found_valid = False
+                for i in range(10):
                     if not self.running:
+                        self.logger.debug("Serial GPS handler stopped by user.")
                         break
                     line = ser.readline().decode('utf-8', errors='ignore')
+                    self.logger.debug(f"[Serial] Line {i+1}: {line.strip()}")
                     if line.strip():
-                        self._process_nmea_sentence(line)
-                        break
-                        
+                        coords = self.nmea_parser.parse_nmea_sentence(line)
+                        if coords:
+                            lat, lon = coords
+                            self.logger.info(f"[Serial] Parsed valid position: lat={lat}, lon={lon}")
+                            self._update_position(lat, lon)
+                            found_valid = True
+                            break
+                        else:
+                            self.logger.debug(f"[Serial] No valid position in line {i+1}.")
+                if not found_valid:
+                    self.logger.warning("[Serial] No valid GPS position found in 10 lines.")
         except Exception as e:
-            self.logger.debug(f"Serial GPS error: {e}")
+            self.logger.error(f"Serial GPS error: {e}")
     
     def _handle_gpsd_gps(self):
-        """Handle GPSD GPS data."""
-        if gpsd is None:
-            self.logger.error("GPSD not available - install gpsd-py3")
-            return
-        
+        """Handle GPSD GPS data using direct socket communication."""
         try:
             host = self.config.get('GPS_GPSD', 'gpsd_host', fallback='localhost')
             port = self.config.getint('GPS_GPSD', 'gpsd_port', fallback=2947)
             timeout = self.config.getint('GPS_GPSD', 'gpsd_timeout', fallback=10)
             
-            gpsd.connect(host, port)
-            packet = gpsd.get_current()
+            self.logger.debug(f"Connecting to GPSD at {host}:{port}, timeout {timeout}s")
             
-            if packet.mode >= 2:  # 2D or 3D fix
-                lat = packet.lat
-                lon = packet.lon
-                self._update_position(lat, lon)
+            # Create socket connection to GPSD
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            sock.connect((host, port))
+            
+            # Send version command to get JSON output
+            sock.send(b'?VERSION;\n')
+            version_response = sock.recv(1024).decode('utf-8', errors='ignore')
+            self.logger.debug(f"GPSD version: {version_response.strip()}")
+            
+            # Send watch command to enable JSON output
+            sock.send(b'?WATCH={"enable":true,"json":true};\n')
+            watch_response = sock.recv(1024).decode('utf-8', errors='ignore')
+            self.logger.debug(f"GPSD watch response: {watch_response.strip()}")
+            
+            # Set shorter timeout for data reading
+            sock.settimeout(2.0)
+            
+            # Buffer for incomplete JSON lines
+            buffer = ""
+            found_valid = False
+            
+            # Try to read GPS data multiple times (similar to serial GPS)
+            for attempt in range(10):
+                if not self.running:
+                    self.logger.debug("GPSD handler stopped by user.")
+                    break
                 
+                try:
+                    # Read data from GPSD
+                    data = sock.recv(1024).decode('utf-8', errors='ignore')
+                    if not data:
+                        self.logger.debug(f"[GPSD] No data received on attempt {attempt + 1}")
+                        continue
+                    
+                    self.logger.debug(f"[GPSD] Raw data attempt {attempt + 1}: {repr(data)}")
+                    
+                    # Add to buffer and process complete lines
+                    buffer += data
+                    lines = buffer.split('\n')
+                    
+                    # Keep the last line in buffer (might be incomplete)
+                    buffer = lines[-1]
+                    
+                    # Process complete lines
+                    for line in lines[:-1]:
+                        line = line.strip()
+                        if line.startswith('{') and line.endswith('}'):
+                            try:
+                                gps_data = json.loads(line)
+                                self.logger.debug(f"[GPSD] JSON: {gps_data}")
+                                
+                                # Check if this is a TPV (Time Position Velocity) report
+                                if gps_data.get('class') == 'TPV':
+                                    lat = gps_data.get('lat')
+                                    lon = gps_data.get('lon')
+                                    mode = gps_data.get('mode', 0)
+                                    
+                                    if lat is not None and lon is not None and mode >= 2:  # 2D or 3D fix
+                                        self.logger.info(f"[GPSD] Parsed valid position: lat={lat}, lon={lon}, mode={mode}")
+                                        self._update_position(lat, lon)
+                                        found_valid = True
+                                        break
+                                    else:
+                                        self.logger.debug(f"[GPSD] No valid position in TPV: lat={lat}, lon={lon}, mode={mode}")
+                                
+                                # Check if this is a SKY (Satellite) report for time sync
+                                elif gps_data.get('class') == 'SKY':
+                                    time_str = gps_data.get('time')
+                                    if time_str:
+                                        try:
+                                            # Parse GPSD time format (ISO 8601)
+                                            gps_time = datetime.fromisoformat(time_str.replace('Z', '+00:00'))
+                                            self.nmea_parser.last_utc_time = gps_time
+                                            self.logger.debug(f"[GPSD] Parsed time: {gps_time}")
+                                        except Exception as e:
+                                            self.logger.debug(f"[GPSD] Error parsing time {time_str}: {e}")
+                            
+                            except json.JSONDecodeError as e:
+                                self.logger.debug(f"[GPSD] JSON decode error: {e}")
+                                continue
+                    
+                    if found_valid:
+                        break
+                        
+                except socket.timeout:
+                    self.logger.debug(f"[GPSD] Timeout on attempt {attempt + 1}")
+                    continue
+                except Exception as e:
+                    self.logger.debug(f"[GPSD] Error on attempt {attempt + 1}: {e}")
+                    break
+            
+            if not found_valid:
+                self.logger.warning("[GPSD] No valid GPS position found in 10 attempts.")
+            
+            sock.close()
+            self.logger.debug(f"GPSD connection to {host}:{port} closed")
+            
         except Exception as e:
-            self.logger.debug(f"GPSD error: {e}")
+            self.logger.error(f"GPSD error: {e}")
     
     def _process_nmea_sentence(self, sentence: str):
         """Process NMEA sentence and update position."""
@@ -530,14 +803,64 @@ class GPSManager:
             self.last_update = datetime.now()
             
             self.logger.info(f"Grid square updated: {old_grid} -> {new_grid} (lat: {lat:.6f}, lon: {lon:.6f})")
-    
+        
+        if self.sync_system_clock:
+            gps_time = self.nmea_parser.last_utc_time  # Assume parser stores last UTC time as datetime
+            if gps_time:
+                now = datetime.now(UTC)
+                drift = abs((gps_time - now).total_seconds())
+                if (self.last_sync_time is None or (datetime.now(UTC) - self.last_sync_time).total_seconds() > self.sync_min_interval) and drift > self.sync_threshold_seconds:
+                    self.logger.info(f"Syncing system clock to GPS time: {gps_time.isoformat()} (drift: {drift:.2f}s)")
+                    try:
+                        if platform.system() == 'Windows':
+                            # Prepare SYSTEMTIME structure
+                            class SYSTEMTIME(ctypes.Structure):
+                                _fields_ = [
+                                    ("wYear", ctypes.c_ushort),
+                                    ("wMonth", ctypes.c_ushort),
+                                    ("wDayOfWeek", ctypes.c_ushort),
+                                    ("wDay", ctypes.c_ushort),
+                                    ("wHour", ctypes.c_ushort),
+                                    ("wMinute", ctypes.c_ushort),
+                                    ("wSecond", ctypes.c_ushort),
+                                    ("wMilliseconds", ctypes.c_ushort),
+                                ]
+                            systime = SYSTEMTIME()
+                            systime.wYear = gps_time.year
+                            systime.wMonth = gps_time.month
+                            systime.wDay = gps_time.day
+                            systime.wHour = gps_time.hour
+                            systime.wMinute = gps_time.minute
+                            systime.wSecond = gps_time.second
+                            systime.wMilliseconds = int(gps_time.microsecond / 1000)
+                            # Set system time (UTC)
+                            if not ctypes.windll.kernel32.SetSystemTime(ctypes.byref(systime)):
+                                raise ctypes.WinError()
+                        else:
+                            # Linux: use date or timedatectl
+                            date_str = gps_time.strftime('%Y-%m-%d %H:%M:%S')
+                            try:
+                                subprocess.run(['sudo', 'date', '-u', '--set', date_str], check=True)
+                            except Exception as e:
+                                # Try timedatectl as fallback
+                                subprocess.run(['sudo', 'timedatectl', 'set-time', date_str], check=True)
+                        self.logger.info("System clock successfully synced to GPS time.")
+                        self.last_sync_time = datetime.now(UTC)
+                    except Exception as e:
+                        self.logger.error(f"Failed to sync system clock: {e}")
+
     def get_current_grid(self) -> Optional[str]:
         """Get current grid square."""
         return self.current_grid
-    
+
     def get_last_update(self) -> Optional[datetime]:
         """Get timestamp of last grid update."""
         return self.last_update
+
+    def info_and_print(self, msg):
+        self.logger.info(msg)
+        if not self.config.getboolean('LOGGING', 'debug_mode', fallback=False):
+            print(msg)
 
 
 class ApplicationCommunicator:
@@ -801,15 +1124,13 @@ class ApplicationCommunicator:
         return bytes(packet)
     
     def _send_pending_wsjtx_grid_update(self):
-        # Send the pending grid update to WSJT-X after a short delay, multiple times for reliability
+        # Send the pending grid update to WSJT-X after a short delay, only once
         if hasattr(self, 'pending_grid_value') and self.pending_grid_value:
             self.logger.info(f"Preparing to send pending grid update to WSJT-X: {self.pending_grid_value}")
             self.logger.info(f"WSJT-X update will be sent to {self.wsjtx_last_addr} with ID {self.wsjtx_id}")
             time.sleep(2)  # Wait 2 seconds before sending
-            for i in range(3):
-                self.logger.info(f"Sending pending grid update to WSJT-X (attempt {i+1}/3): {self.pending_grid_value}")
-                self.send_wsjtx_grid_update(self.pending_grid_value)
-                time.sleep(1)
+            self.logger.info(f"Sending pending grid update to WSJT-X: {self.pending_grid_value}")
+            self.send_wsjtx_grid_update(self.pending_grid_value)
             self.wsjtx_pending_grid_update = False
             self.pending_grid_value = None
 
@@ -837,24 +1158,29 @@ class AutoGrid:
         self.retry_interval = self.config.getint('APPLICATIONS', 'retry_interval', fallback=5)
         self.max_retries = self.config.getint('APPLICATIONS', 'max_retries', fallback=3)
     
+    def info_and_print(self, msg):
+        self.logger.info(msg)
+        if not self.config.getboolean('LOGGING', 'debug_mode', fallback=False):
+            print(msg)
+
     def start(self):
         """Start the application."""
-        self.logger.info("Starting WSJT-X/JS8-Call Auto Grid")
-        self.logger.info(f"GPS Source: {self.config.get('GPS', 'gps_source')}")
+        self.info_and_print("Starting WSJT-X/JS8-Call Auto Grid")
+        self.info_and_print(f"GPS Source: {self.config.get('GPS', 'gps_source')}")
         
         # Start GPS monitoring
         self.gps_manager.start()
         
         # Start communication
         if not self.app_comm.start():
-            self.logger.warning("Failed to start application communication")
+            self.logger.info("Failed to start application communication")
         
         self.running = True
         self._main_loop()
     
     def stop(self):
         """Stop the application."""
-        self.logger.info("Stopping WSJT-X/JS8-Call Auto Grid")
+        self.info_and_print("Stopping WSJT-X/JS8-Call Auto Grid")
         self.running = False
         
         self.gps_manager.stop()
@@ -867,14 +1193,14 @@ class AutoGrid:
                 wsjtx_running, js8call_running = self.app_comm.check_heartbeats()
                 # Detect transitions for WSJT-X
                 if wsjtx_running and not self.wsjtx_detected:
-                    self.logger.info("WSJT-X detected")
+                    self.info_and_print("WSJT-X detected")
                 if not wsjtx_running and self.wsjtx_detected:
-                    self.logger.info("WSJT-X no longer detected")
+                    self.info_and_print("WSJT-X no longer detected")
                 # Detect transitions for JS8Call
                 if js8call_running and not self.js8call_detected:
-                    self.logger.info("JS8-Call detected")
+                    self.info_and_print("JS8-Call detected")
                 if not js8call_running and self.js8call_detected:
-                    self.logger.info("JS8-Call no longer detected")
+                    self.info_and_print("JS8-Call no longer detected")
                 # Immediately send grid update if either app was just (re)detected
                 current_grid = self.gps_manager.get_current_grid()
                 if current_grid:
@@ -897,10 +1223,10 @@ class AutoGrid:
                 else:
                     time.sleep(self.sleep_interval)
             except KeyboardInterrupt:
-                self.logger.info("Received interrupt signal")
+                self.info_and_print("Received interrupt signal")
                 break
             except Exception as e:
-                self.logger.error(f"Main loop error: {e}")
+                self.logger.info(f"Main loop error: {e}")
                 time.sleep(self.retry_interval)
     
     def _update_grid_squares(self):
@@ -925,11 +1251,11 @@ class AutoGrid:
             if self.app_comm.send_wsjtx_grid_update(grid):
                 return
             else:
-                self.logger.warning(f"WSJT-X grid update attempt {attempt + 1} failed")
+                self.logger.info(f"WSJT-X grid update attempt {attempt + 1} failed")
                 if attempt < self.max_retries - 1:
                     time.sleep(self.retry_interval)
         
-        self.logger.error(f"Failed to send WSJT-X grid update after {self.max_retries} attempts")
+        self.logger.info(f"Failed to send WSJT-X grid update after {self.max_retries} attempts")
     
     def _send_js8call_grid_update_with_retry(self, grid: str):
         """Send JS8-Call grid update with retry mechanism."""
@@ -937,11 +1263,11 @@ class AutoGrid:
             if self.app_comm.send_js8call_grid_update(grid):
                 return
             else:
-                self.logger.warning(f"JS8-Call grid update attempt {attempt + 1} failed")
+                self.logger.info(f"JS8-Call grid update attempt {attempt + 1} failed")
                 if attempt < self.max_retries - 1:
                     time.sleep(self.retry_interval)
         
-        self.logger.error(f"Failed to send JS8-Call grid update after {self.max_retries} attempts")
+        self.logger.info(f"Failed to send JS8-Call grid update after {self.max_retries} attempts")
 
 
 def main():
