@@ -4,12 +4,5 @@
 # Serial communication for GPS devices
 pyserial>=3.5
 
-# Configuration file parsing
-configparser>=5.0.0
-
-# GPSD support is now built-in - no external module required
-
-# Optional: For creating Windows executables
-# pyinstaller>=4.0
-
+# Process detection for linux and windows
 psutil 
