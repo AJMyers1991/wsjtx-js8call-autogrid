@@ -1,6 +1,6 @@
 # WSJT-X/JS8-Call Auto Grid Square Updater
 
-Automatically updates your grid square location in WSJT-X and JS8-Call based on GPS data. This program monitors your GPS position and automatically sends grid square updates to both applications when they start or when your location changes.
+Automatically updates your grid square location in WSJT-X and JS8-Call based on GPS data. This program monitors your GPS position and automatically sends grid square updates to both applications when they start or when your location changes.  Available in source as python or for Windows machines as executable installer.  Exe version has a basic GUI for settings and viewing information as well as option for stopping and starting the service.
 
 ## Features
 
@@ -306,5 +306,6 @@ This project is licensed under the MIT License.
 Contributions are welcome! Please feel free to submit issues, feature requests, or pull requests.
 
 ## Version History
+
 
 - **v1.0.0**: Initial release with support for WSJT-X and JS8-Call 
